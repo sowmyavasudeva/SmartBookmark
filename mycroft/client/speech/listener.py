@@ -13,26 +13,24 @@
 # limitations under the License.
 #
 import time
+import datetime
+from Queue import Queue, Empty
 from threading import Thread
-import sys
+
 import speech_recognition as sr
 from pyee import EventEmitter
-from requests import RequestException, HTTPError
+from requests import HTTPError
 from requests.exceptions import ConnectionError
 
-from mycroft import dialog
+import mycroft.dialog
 from mycroft.client.speech.hotword_factory import HotWordFactory
 from mycroft.client.speech.mic import MutableMicrophone, ResponsiveRecognizer
-from mycroft.configuration import Configuration
-from mycroft.metrics import MetricsAggregator, Stopwatch, report_timing
+from mycroft.client.speech.recognizer.pocketsphinx_recognizer import PocketsphinxRecognizer
+from mycroft.configuration import ConfigurationManager
+from mycroft.metrics import MetricsAggregator
 from mycroft.session import SessionManager
 from mycroft.stt import STTFactory
-from mycroft.util import connected
 from mycroft.util.log import LOG
-if sys.version_info[0] < 3:
-    from Queue import Queue, Empty
-else:
-    from queue import Queue, Empty
 
 
 class AudioProducer(Thread):
@@ -55,16 +53,17 @@ class AudioProducer(Thread):
         with self.mic as source:
             self.recognizer.adjust_for_ambient_noise(source)
             while self.state.running:
+                LOG.info("Microphone listening started")
                 try:
                     audio = self.recognizer.listen(source, self.emitter)
                     self.queue.put(audio)
-                except IOError as e:
+                except IOError, ex:
                     # NOTE: Audio stack on raspi is slightly different, throws
                     # IOError every other listen, almost like it can't handle
                     # buffering audio between listen loops.
                     # The internet was not helpful.
                     # http://stackoverflow.com/questions/10733903/pyaudio-input-overflowed
-                    self.emitter.emit("recognizer_loop:ioerror", e)
+                    self.emitter.emit("recognizer_loop:ioerror", ex)
 
     def stop(self):
         """
@@ -94,6 +93,13 @@ class AudioConsumer(Thread):
         self.wakeup_recognizer = wakeup_recognizer
         self.wakeword_recognizer = wakeword_recognizer
         self.metrics = MetricsAggregator()
+        self.config = ConfigurationManager.get()
+        emitter.on("recognizer_loop:hotword", self.set_word)
+
+    def set_word(self, event):
+        if event.get("start_listening"):
+                 # set new hot word
+                 self.hotword = event.get("hotword", self.wakeword_recognizer.key_phrase)
 
     def run(self):
         while self.state.running:
@@ -118,7 +124,7 @@ class AudioConsumer(Thread):
         if self.wakeup_recognizer.found_wake_word(audio.frame_data):
             SessionManager.touch()
             self.state.sleeping = False
-            self.emitter.emit('recognizer_loop:awoken')
+            self.__speak(mycroft.dialog.get("i am awake", self.stt.lang))
             self.metrics.increment("mycroft.wakeup")
 
     @staticmethod
@@ -129,8 +135,15 @@ class AudioConsumer(Thread):
     # TODO: Localization
     def process(self, audio):
         SessionManager.touch()
+	"""
+	if self.hotword:
+            word = self.hotword
+            self.hotword = None
+        else:
+	"""
+        word = self.wakeword_recognizer.key_phrase
         payload = {
-            'utterance': self.wakeword_recognizer.key_phrase,
+            'utterance': word,
             'session': SessionManager.get().session_id,
         }
         self.emitter.emit("recognizer_loop:wakeword", payload)
@@ -138,60 +151,48 @@ class AudioConsumer(Thread):
         if self._audio_length(audio) < self.MIN_AUDIO_SIZE:
             LOG.warning("Audio too short to be processed")
         else:
-            stopwatch = Stopwatch()
-            with stopwatch:
-                transcription = self.transcribe(audio)
-            if transcription:
-                ident = str(stopwatch.timestamp) + str(hash(transcription))
-                # STT succeeded, send the transcribed speech on for processing
-                payload = {
-                    'utterances': [transcription],
-                    'lang': self.stt.lang,
-                    'session': SessionManager.get().session_id,
-                    'ident': ident
-                }
-                self.emitter.emit("recognizer_loop:utterance", payload)
-                self.metrics.attr('utterances', [transcription])
-            else:
-                ident = str(stopwatch.timestamp)
-            # Report timing metrics
-            report_timing(ident, 'stt', stopwatch,
-                          {'transcription': transcription,
-                           'stt': self.stt.__class__.__name__})
+            self.transcribe(audio)
 
     def transcribe(self, audio):
+        LOG.debug("Transcribing audio")
+        text = None
         try:
             # Invoke the STT engine on the audio clip
             text = self.stt.execute(audio).lower().strip()
-            LOG.debug("STT: " + text)
-            return text
+            LOG.debug("STT: --------->" + text)
         except sr.RequestError as e:
             LOG.error("Could not request Speech Recognition {0}".format(e))
         except ConnectionError as e:
             LOG.error("Connection Error: {0}".format(e))
-
             self.emitter.emit("recognizer_loop:no_internet")
         except HTTPError as e:
             if e.response.status_code == 401:
+                text = "pair my device"  # phrase to start the pairing process
                 LOG.warning("Access Denied at mycroft.ai")
-                return "pair my device"  # phrase to start the pairing process
-            else:
-                LOG.error(e.__class__.__name__ + ': ' + str(e))
-        except RequestException as e:
-            LOG.error(e.__class__.__name__ + ': ' + str(e))
         except Exception as e:
-            self.emitter.emit('recognizer_loop:speech.recognition.unknown')
-            if isinstance(e, IndexError):
-                LOG.info('no words were transcribed')
-            else:
-                LOG.error(e)
+            LOG.error(e)
             LOG.error("Speech Recognition could not understand audio")
-            return None
-        if connected():
-            dialog_name = 'backend.down'
-        else:
-            dialog_name = 'not connected to the internet'
-        self.emitter.emit('speak', {'utterance': dialog.get(dialog_name)})
+        if text:
+            # STT succeeded, send the transcribed speech on for processing
+            LOG.error("maine samjha tune bola "+ text)
+            tellMeMore = "tell me more"
+            if(text == tellMeMore):
+                #hotWordListener = self.finalHotWord
+                LOG.info("found tell me more in listener****")
+                #text = text + " about " + hotWordListener
+                with open("hotWordFile.txt", "rw+") as hotWordTemp:
+                        prevHotWord = hotWordTemp.read()
+                        hotWordTemp.truncate(0)
+                        text = "tell me about " + prevHotWord
+                        LOG.error(" naya wala maine samjha tune bola "+ text)
+
+            payload = {
+                'utterances': [text],
+                'lang': self.stt.lang,
+                'session': SessionManager.get().session_id
+            }
+            self.emitter.emit("recognizer_loop:utterance", payload)
+            self.metrics.attr('utterances', [text])
 
     def __speak(self, utterance):
         payload = {
@@ -222,7 +223,8 @@ class RecognizerLoop(EventEmitter):
         """
             Load configuration parameters from configuration
         """
-        config = Configuration.get()
+        LOG.info("*********loading configuration")
+        config = ConfigurationManager.get()
         self.config_core = config
         self._config_hash = hash(str(config))
         self.lang = config.get('lang')
@@ -234,14 +236,49 @@ class RecognizerLoop(EventEmitter):
                                             mute=self.mute_calls > 0)
         # FIXME - channels are not been used
         self.microphone.CHANNELS = self.config.get('channels')
-        self.wakeword_recognizer = self.create_wake_word_recognizer()
+        self.wakeword_recognizer = self.create_wake_word_recognizer(rate,self.lang)
         # TODO - localization
-        self.wakeup_recognizer = self.create_wakeup_recognizer()
+        self.wakeup_recognizer = self.create_wakeup_recognizer(rate,self.lang)
+        self.hot_word_engines = {}
+        self.create_hot_word_engines()
+        self.wakeup_recognizer = self.create_wakeup_recognizer(rate, self.lang)
         self.responsive_recognizer = ResponsiveRecognizer(
-            self.wakeword_recognizer)
+            self.wakeword_recognizer, self.hot_word_engines)
         self.state = RecognizerLoopState()
 
-    def create_wake_word_recognizer(self):
+    def create_hot_word_engines(self):
+        LOG.info("###############********creating hotword engines************************************************************************")
+        hot_words = self.config_core.get("hotwords", {})
+        for word in hot_words:
+                     print("wake word creation for one word started:-"+str(datetime.datetime.now()))
+                     data = hot_words[word]
+                     print("#######################xx***********************************found wake word************************************************************************")
+                     #if not data.get("active", True):
+                         #continue
+                     engine_type = data["module"]
+                     ding = data.get("sound")
+                     utterance = data.get("utterance")
+                     listen = data.get("listen", True)
+                     # data = data["data"]
+                     LOG.info("Creating hotword engine for " + word)
+                     lang = self.config_core.get("lang", "en-us")
+		     print("@@@@@@@@@@@ lang @@@@@@@@@@@@@@@@@@@@@",lang)
+                     # rate = self.config.get("rate")
+                     hot_word = data.get("hot_word")
+                     print("@@@@@@@@@@@ hot_word @@@@@@@@@@@@@@@@@@@@@",hot_word)
+                     phonemes = data.get('phonemes')
+		     print("@@@@@@@@@@@ phonemes @@@@@@@@@@@@@@@@@@@@@",phonemes)
+                     threshold = data.get('threshold')
+                     engine = PocketsphinxRecognizer(hot_word, phonemes,
+                                                     threshold, 16000, lang)
+                     print("wake word for one word finished:-"+str(datetime.datetime.now()))
+		     if engine is None:
+				print("engine is null!!!!!!")
+                     self.hot_word_engines[word] = [engine, ding, utterance,
+                                                   engine_type]
+
+
+    def create_wake_word_recognizer(self, rate, lang):
         # Create a local recognizer to hear the wakeup word, e.g. 'Hey Mycroft'
         LOG.info("creating wake word engine")
         word = self.config.get("wake_word", "hey mycroft")
@@ -249,9 +286,8 @@ class RecognizerLoop(EventEmitter):
         phonemes = self.config.get("phonemes")
         thresh = self.config.get("threshold")
         config = self.config_core.get("hotwords", {word: {}})
-
         if word not in config:
-            config[word] = {'module': 'pocketsphinx'}
+            config[word] = {}
         if phonemes:
             config[word]["phonemes"] = phonemes
         if thresh:
@@ -260,7 +296,7 @@ class RecognizerLoop(EventEmitter):
             config = None
         return HotWordFactory.create_hotword(word, config, self.lang)
 
-    def create_wakeup_recognizer(self):
+    def create_wakeup_recognizer(self, rate, lang):
         LOG.info("creating stand up word engine")
         word = self.config.get("stand_up_word", "wake up")
         return HotWordFactory.create_hotword(word, lang=self.lang)
@@ -332,7 +368,7 @@ class RecognizerLoop(EventEmitter):
             try:
                 time.sleep(1)
                 if self._config_hash != hash(
-                        str(Configuration().get())):
+                        str(ConfigurationManager().get())):
                     LOG.debug('Config has changed, reloading...')
                     self.reload()
             except KeyboardInterrupt as e:
